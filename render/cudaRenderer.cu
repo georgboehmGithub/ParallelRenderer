@@ -14,16 +14,11 @@
 #include "sceneLoader.h"
 #include "util.h"
 
-// Important to define before inclusions (see Usage in exclusiveScan.cu_inl)
-#define BLOCKDIM 32 // TODO: CHANGE
-#define BLOCKSIZE (BLOCKDIM * BLOCKDIM) // TODO: CHANGE
-#define SCAN_BLOCK_DIM BLOCKSIZE // TODO: CHANGE
-
-#include "circleBoxTest.cu_inl" // CHANGED
-#include "exclusiveScan.cu_inl" // CHANGED
-
-
-
+#define SCAN_BLOCK_DIM 256 // same as block size
+#include "exclusiveScan.cu_inl"
+#define BLOCK_DIM 16
+#define BLOCK_SIZE 256 // 16 * 16
+#include "circleBoxTest.cu_inl"
 
 ////////////////////////////////////////////////////////////////////////////////////////
 // Putting all the cuda kernels here
@@ -66,45 +61,6 @@ __constant__ float  cuConstColorRamp[COLOR_MAP_SIZE][3];
 // file simpler and to seperate code that should not be modified
 #include "noiseCuda.cu_inl"
 #include "lookupColor.cu_inl"
-
-// TODO: MOVE TO exclusiveScan.cu_inl
-__inline__ __device__ void
-sharedMemInclusiveScan(int threadIndex, uint* sInput, uint* sOutput, volatile uint* sScratch, uint size)
-{
-    if (size > WARP_SIZE) {
-
-        uint idata = sInput[threadIndex];
-
-        //Bottom-level inclusive warp scan
-        uint warpResult = warpScanInclusive(threadIndex, idata, sScratch, WARP_SIZE);
-
-        // Save top elements of each warp for exclusive warp scan sync
-        // to wait for warp scans to complete (because s_Data is being
-        // overwritten)
-        __syncthreads();
-
-        if ( (threadIndex & (WARP_SIZE - 1)) == (WARP_SIZE - 1) )
-            sScratch[threadIndex >> LOG2_WARP_SIZE] = warpResult;
-
-        // wait for warp scans to complete
-        __syncthreads();
-        if ( threadIndex < (SCAN_BLOCK_DIM / WARP_SIZE)) {
-            // grab top warp elements
-            uint val = sScratch[threadIndex];
-            // calculate exclusive scan and write back to shared memory
-            sScratch[threadIndex] = warpScanExclusive(threadIndex, val, sScratch, size >> LOG2_WARP_SIZE);
-        }
-
-        //return updated warp scans with exclusive scan results
-        __syncthreads();
-
-        sOutput[threadIndex] = warpResult + sScratch[threadIndex >> LOG2_WARP_SIZE];
-
-    } else if (threadIndex < WARP_SIZE) {
-        uint idata = sInput[threadIndex];
-        sOutput[threadIndex] = warpScanInclusive(threadIndex, idata, sScratch, size);
-    }
-}
 
 
 // kernelClearImageSnowflake -- (CUDA device code)
@@ -367,6 +323,7 @@ __global__ void kernelAdvanceSnowflake() {
 // given a pixel and a circle, determines the contribution to the
 // pixel from the circle.  Update of the image is done in this
 // function.  Called by kernelRenderCircles()
+// TODO: CHECK IF SAME AS PROVIDED FILE
 __device__ __inline__ void
 shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
 
@@ -427,150 +384,90 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
     // END SHOULD-BE-ATOMIC REGION
 }
 
-__device__ __inline__ void
-circlesInBox(uint circleIndex, uint tIndex, uint* inputArray, float boxL, float boxR, float boxT, float boxB) {
-    int index3 = 3 * circleIndex;
-    // read position and radius of circle
-    float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
-    float  rad = cuConstRendererParams.radius[circleIndex];
-
-    inputArray[tIndex] = circleInBox(p.x, p.y, rad, boxL, boxR, boxT, boxB);
+// TODO REWRITE
+// TODO: CHANGE VARIABLE NAMES?
+__inline__ __device__ void
+circlesInBox(size_t circleIndex, size_t threadIndex, uint* inputArray, float boxL, float boxR, float boxT, float boxB) {
+    // TODO PUT INFRONT OF circlesInBox CALL OUTSIDE OF THIS FUNCTION!!!
+    if (circleIndex >= cuConstRendererParams.numCircles) {
+        inputArray[threadIndex] = 0;
+    } else {
+        // int index3 = 3 * circleIndex; // TODO: REENACT
+        // read position and radius of circle
+        float3 p = *(float3*)(&cuConstRendererParams.position[circleIndex * 3]);
+        float  rad = cuConstRendererParams.radius[circleIndex];
+        inputArray[threadIndex] = static_cast<uint> (circleInBox(p.x, p.y, rad, boxL, boxR, boxT, boxB)); // TODO: LEAVE OUT STATIC CAST
+    }
 }
 
-__device__ __inline__ void
-circlesInBoxById(uint circleIndex, uint tIndex, uint* sOutput, uint* circleIndices) { // TODO: REWRITE
-    if (tIndex == 0) {
-        if (sOutput[tIndex] == 1) {
+// TODO REWRITE
+// TODO: CHANGE VARIABLE NAMES?
+__inline__ __device__ void
+circlesInBoxById(uint circleIndex, uint threadIndex, uint* sOutput, uint* circleIndices) {
+    if (threadIndex == 0) {
+        if (sOutput[threadIndex] == 1) {
             circleIndices[0] = circleIndex;
-        } else if (sOutput[tIndex] == sOutput[tIndex - 1] + 1) { // A circle was added at this thread index -> add its circle Index
-            circleIndices[sOutput[tIndex - 1]] = circleIndex;
         }
+    }
+    else if (sOutput[threadIndex] == sOutput[threadIndex - 1] + 1) { // A circle was added at this thread index -> add its circle Index
+        circleIndices[sOutput[threadIndex - 1]] = circleIndex;
     }
 }
 
-// kernelRenderCircles -- (CUDA device code)
-//
-// Each thread renders a circle.  Since there is no protection to
-// ensure order of update or mutual exclusion on the output image, the
-// resulting image will be incorrect.
 __global__ void kernelRenderCircles() {
-    uint threadIndex = blockDim.x * threadIdx.y + threadIdx.x;
+    // linear thread index
+    int threadIndex = blockDim.y * threadIdx.y + threadIdx.x;
+
+    // Treat each thread as a pixel later
+    float4* imgPtr;
+    float2 pixelCenterNorm;
+    float4 color;
+    int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
+    int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
+
+    // Define box for each threadblock needed for circleInBox() test (circleBoxTest.cu_inl)
+    float boxL = static_cast<float>(blockIdx.x) / static_cast<float>(gridDim.x);
+    float boxR = boxL + static_cast<float>(blockDim.x) / static_cast<float>(cuConstRendererParams.imageWidth);
+    float boxB = static_cast<float>(blockIdx.y) / static_cast<float>(gridDim.y);
+    float boxT = boxB + static_cast<float>(blockDim.y) / static_cast<float>(cuConstRendererParams.imageHeight);
+
+    // Define scan input and output arrays needed for inclusive scan operation (exclusiveScan.cu_inl)
+    __shared__ uint scanInput[BLOCK_SIZE]; // binary array -> 1 if circle in box, 0 otherwise
+    __shared__ uint scanOutput[BLOCK_SIZE]; // holds output from scan operation
+    __shared__ uint scanScratch[2*BLOCK_SIZE];
+    __shared__ uint circlesById[BLOCK_SIZE]; // Holds final circle ids that are in box
     
-    float invWidth = 1.f / cuConstRendererParams.imageWidth; // CHANGED
-    float invHeight = 1.f / cuConstRendererParams.imageHeight; // CHANGED
+    float invWidth = 1.f / cuConstRendererParams.imageWidth;
+    float invHeight = 1.f / cuConstRendererParams.imageHeight;
 
-    // Assign pixel to each thread beforehand
-    uint pixelX = blockDim.x * blockIdx.x + threadIdx.x;
-    uint pixelY = blockDim.y * blockIdx.y + threadIdx.y;
+    // TODO: Was genau machst du hier und warum? -> Siehste wahrscheinlich in der ursprünglichen Datei besser
+    imgPtr = (float4*) &cuConstRendererParams.imageData[4 * (pixelY * cuConstRendererParams.imageWidth + pixelX)];
+    color = *imgPtr;
+    pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f), invHeight * (static_cast<float>(pixelY) + 0.5f));
 
-    // Define box for each thread by coordinates for circle in box tests
-    // TODO: CHANGE TO THIS VERSION IF POSSIBLE
-    // float boxL = blockIdx.x  / gridDim.x;
-    // float boxR = boxL + blockDim.x / cuConstRendererParams.imageWidth;
-    // float boxB = blockIdx.y / gridDim.y;
-    // float boxT = boxB + blockDim.y / cuConstRendererParams.imageHeight;
+    // main loop
+    for (int i = 0; i < cuConstRendererParams.numCircles; i += BLOCK_SIZE) {
+        int circleIndex = threadIndex + i;
+        circlesInBox(circleIndex, threadIndex, scanInput, boxL, boxR, boxT, boxB); // Find circles in box
+        __syncthreads();
+        sharedMemInclusiveScan(threadIndex, scanInput, scanOutput, scanScratch, BLOCK_SIZE); // Perform scan operation
+        __syncthreads();
+        circlesInBoxById(circleIndex, threadIndex, scanOutput, circlesById); // Find ids of circles in box
+        __syncthreads();
+        int numCirclesInBox = scanOutput[BLOCK_SIZE-1]; // last element of scan operation == number of circles in box
 
-    float boxL = static_cast<float>(blockIdx.x)  / gridDim.x;
-    float boxR = boxL + static_cast<float>(blockDim.x) / cuConstRendererParams.imageWidth;
-    float boxB = static_cast<float>(blockIdx.y) / gridDim.y;
-    float boxT = boxB + static_cast<float>(blockDim.y) / cuConstRendererParams.imageHeight;
-
-    // Allocate shared memory for scan operations later on
-    __shared__ uint scanInput[BLOCKSIZE]; // size must be constant
-    __shared__ uint scanOutput[BLOCKSIZE];
-    __shared__ uint scanScratch[2 * BLOCKSIZE];
-
-    float4* imgPtr; // TODO CHANGE
-    float2 pixelCenterNorm; // TODO CHANGE
-    float4 color; // TODO CHANGE
-    
-
-    if (pixelX < cuConstRendererParams.imageWidth && pixelY < cuConstRendererParams.imageHeight) { // Make sure pixel does not lie outside of image
-    imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * cuConstRendererParams.imageWidth + pixelX)]);
-    pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f), // TODO RENAME
-                                                  invHeight * (static_cast<float>(pixelY) + 0.5f));
-    color = *imgPtr; // current color of pixel
-    }
-
-    // Coloring step
-    for (int i = 0; i < cuConstRendererParams.numCircles; i += BLOCKSIZE) {
-        uint circleIdx = threadIndex + i;
-
-        // Find circles in box
-        if (circleIdx < cuConstRendererParams.numCircles) { // TODO: THIS MIGHT BE WRONG!!
-            circlesInBox(circleIdx, threadIndex, scanInput, boxL, boxR, boxT, boxB);
+        // go over circles in box and update color
+        for (int j = 0; j < numCirclesInBox; j++) {
+            uint circleIndex = circlesById[j];
+            float3 p = *(float3*)(&cuConstRendererParams.position[circleIndex * 3]);
+            shadePixel(circleIndex, pixelCenterNorm, p, &color);
         }
         __syncthreads();
-    
-        // Perform scan operation
-        sharedMemInclusiveScan(threadIndex, scanInput, scanOutput, scanScratch, BLOCKSIZE);
-        __syncthreads();
-
-        // Find circle ids for coloring
-        // TODO: THIS MIGHT BE WRONG --> CHANGE TO BLOCKSIZE
-        uint circlesInBox = scanOutput[cuConstRendererParams.numCircles - 1]; // Last element of scan operations tells how many circles there are in this box
-        uint* cIds = [circlesInBox];
-        circlesInBoxById(circleIdx, threadIndex, scanOutput, cIds);
-        __syncthreads();
-
-        // Add colors to curent color
-        if (pixelX < cuConstRendererParams.imageWidth && pixelY < cuConstRendererParams.imageHeight) { // Make sure pixel does not lie outside of image
-            for (int c = 0; c < circlesInBox; c++) {
-                int curIndex = cIds[c];
-                int index3 = 3 * curIndex;
-                // read position and radius of circle
-                float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
-                shadePixel(curIndex, pixelCenterNorm, p, &color); // TODO CHANGE!!!!
-            }
-        __syncthreads();
-        }
     }
-    // TODO: DO YOU NEED THIS??
-    if (pixelX < cuConstRendererParams.imageWidth && pixelY < cuConstRendererParams.imageHeight) { // Make sure pixel does not lie outside of image
-        *imgPtr = color; // Update color
-    }
+    *imgPtr = color;
 }
 
-    // int index = blockIdx.x * blockDim.x + threadIdx.x;
 
-    // if (index >= cuConstRendererParams.numCircles)
-    //     return;
-
-    // int index3 = 3 * index;
-
-    // // read position and radius
-    // float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
-    // float  rad = cuConstRendererParams.radius[index];
-
-    // // compute the bounding box of the circle. The bound is in integer
-    // // screen coordinates, so it's clamped to the edges of the screen.
-    // short imageWidth = cuConstRendererParams.imageWidth;
-    // short imageHeight = cuConstRendererParams.imageHeight;
-    // short minX = static_cast<short>(imageWidth * (p.x - rad));
-    // short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
-    // short minY = static_cast<short>(imageHeight * (p.y - rad));
-    // short maxY = static_cast<short>(imageHeight * (p.y + rad)) + 1;
-
-    // // a bunch of clamps.  Is there a CUDA built-in for this?
-    // short screenMinX = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
-    // short screenMaxX = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
-    // short screenMinY = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
-    // short screenMaxY = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
-
-    // float invWidth = 1.f / imageWidth;
-    // float invHeight = 1.f / imageHeight;
-
-    // // for all pixels in the bonding box
-    // for (int pixelY=screenMinY; pixelY<screenMaxY; pixelY++) {
-    //     float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + screenMinX)]);
-    //     for (int pixelX=screenMinX; pixelX<screenMaxX; pixelX++) {
-    //         float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
-    //                                              invHeight * (static_cast<float>(pixelY) + 0.5f));
-    //         shadePixel(index, pixelCenterNorm, p, imgPtr);
-    //         imgPtr++;
-    //     }
-    // }
-}
 
 ////////////////////////////////////////////////////////////////////////////////////////
 
@@ -780,12 +677,13 @@ CudaRenderer::advanceAnimation() {
 
 void
 CudaRenderer::render() {
-    //const scanBLOCKDIM = BLOCKSIZE // CHANGED
-    dim3 blockDim(BLOCKDIM, BLOCKDIM); // CHANGED
-    size_t gridDimX = (cuConstRendererParams.imageWidth + blockDim.x-1) / blockDim.x; // CHANGE TO UINT
-    size_t gridDimY = (cuConstRendererParams.imageHeight + blockDim.y-1) / blockDim.y; // CHANGE TO UINT
-    dim3 gridDim(gridDimX, gridDimY);
-
+    // 256 threads per block is a healthy number
+    // block dimensions
+    dim3 blockDim(BLOCK_DIM, BLOCK_DIM);
+    // grid dimensions
+    dim3 gridDim(
+        (image->width + blockDim.x-1) / blockDim.x,
+        (image->width + blockDim.y-1) / blockDim.y);
     kernelRenderCircles<<<gridDim, blockDim>>>();
     cudaDeviceSynchronize();
 }
