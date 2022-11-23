@@ -128,6 +128,7 @@ sharedMemInclusiveScan(int threadIndex, uint* sInput, uint* sOutput, volatile ui
 
         // wait for warp scans to complete
         __syncthreads();
+        
         if ( threadIndex < (SCAN_BLOCK_DIM / WARP_SIZE)) {
             // grab top warp elements
             uint val = sScratch[threadIndex];

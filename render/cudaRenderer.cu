@@ -323,7 +323,6 @@ __global__ void kernelAdvanceSnowflake() {
 // given a pixel and a circle, determines the contribution to the
 // pixel from the circle.  Update of the image is done in this
 // function.  Called by kernelRenderCircles()
-// TODO: CHECK IF SAME AS PROVIDED FILE
 __device__ __inline__ void
 shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
 
@@ -384,32 +383,25 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
     // END SHOULD-BE-ATOMIC REGION
 }
 
-// TODO REWRITE
-// TODO: CHANGE VARIABLE NAMES?
 __inline__ __device__ void
 circlesInBox(size_t circleIndex, size_t threadIndex, uint* inputArray, float boxL, float boxR, float boxT, float boxB) {
-    // TODO PUT INFRONT OF circlesInBox CALL OUTSIDE OF THIS FUNCTION!!!
-    if (circleIndex >= cuConstRendererParams.numCircles) {
-        inputArray[threadIndex] = 0;
-    } else {
-        // int index3 = 3 * circleIndex; // TODO: REENACT
-        // read position and radius of circle
+    if (circleIndex < cuConstRendererParams.numCircles) {
+        // int index3 = 3 * circleIndex;
         float3 p = *(float3*)(&cuConstRendererParams.position[circleIndex * 3]);
-        float  rad = cuConstRendererParams.radius[circleIndex];
-        inputArray[threadIndex] = static_cast<uint> (circleInBox(p.x, p.y, rad, boxL, boxR, boxT, boxB)); // TODO: LEAVE OUT STATIC CAST
+        float rad = cuConstRendererParams.radius[circleIndex];
+        // check if circle is in box
+        inputArray[threadIndex] = circleInBox(p.x, p.y, rad, boxL, boxR, boxT, boxB);
+    }
+    else { // can impossibly be in box
+        inputArray[threadIndex] = 0;
     }
 }
 
-// TODO REWRITE
-// TODO: CHANGE VARIABLE NAMES?
 __inline__ __device__ void
 circlesInBoxById(uint circleIndex, uint threadIndex, uint* sOutput, uint* circleIndices) {
-    if (threadIndex == 0) {
-        if (sOutput[threadIndex] == 1) {
-            circleIndices[0] = circleIndex;
-        }
-    }
-    else if (sOutput[threadIndex] == sOutput[threadIndex - 1] + 1) { // A circle was added at this thread index -> add its circle Index
+    int previousCircleCount = sOutput[threadIndex - 1];
+    int currentCircleCount = sOutput[threadIndex];
+    if (currentCircleCount == previousCircleCount + 1) { // A circle was added at this thread index -> add its circle Index
         circleIndices[sOutput[threadIndex - 1]] = circleIndex;
     }
 }
@@ -432,6 +424,7 @@ __global__ void kernelRenderCircles() {
     float boxT = boxB + static_cast<float>(blockDim.y) / static_cast<float>(cuConstRendererParams.imageHeight);
 
     // Define scan input and output arrays needed for inclusive scan operation (exclusiveScan.cu_inl)
+    // -> see REQUIREMENTS for further details
     __shared__ uint scanInput[BLOCK_SIZE]; // binary array -> 1 if circle in box, 0 otherwise
     __shared__ uint scanOutput[BLOCK_SIZE]; // holds output from scan operation
     __shared__ uint scanScratch[2*BLOCK_SIZE];
@@ -445,14 +438,18 @@ __global__ void kernelRenderCircles() {
     color = *imgPtr;
     pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f), invHeight * (static_cast<float>(pixelY) + 0.5f));
 
-    // main loop
+    // main procedure
     for (int i = 0; i < cuConstRendererParams.numCircles; i += BLOCK_SIZE) {
         int circleIndex = threadIndex + i;
         circlesInBox(circleIndex, threadIndex, scanInput, boxL, boxR, boxT, boxB); // Find circles in box
         __syncthreads();
         sharedMemInclusiveScan(threadIndex, scanInput, scanOutput, scanScratch, BLOCK_SIZE); // Perform scan operation
         __syncthreads();
-        circlesInBoxById(circleIndex, threadIndex, scanOutput, circlesById); // Find ids of circles in box
+        if (threadIndex > 0) {
+            circlesInBoxById(circleIndex, threadIndex, scanOutput, circlesById); // Find ids of circles in box
+        } else if (scanOutput[threadIndex] == 1){
+            circlesById[0] = circleIndex;
+        }
         __syncthreads();
         int numCirclesInBox = scanOutput[BLOCK_SIZE-1]; // last element of scan operation == number of circles in box
 
@@ -466,8 +463,6 @@ __global__ void kernelRenderCircles() {
     }
     *imgPtr = color;
 }
-
-
 
 ////////////////////////////////////////////////////////////////////////////////////////
 
